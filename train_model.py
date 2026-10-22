@@ -4,10 +4,10 @@ Phases 3 & 4: Model training, hyperparameter optimization, evaluation, and Adver
 
 Key requirements:
 - Stratified data split: 70% train / 15% validation / 15% test (seed 42)
-- Zero data leakage: StandardScaler fitted strictly on training data via sklearn Pipeline
+- Zero data leakage: StandardScaler fitted strictly on training data (70%) via sklearn Pipeline
 - Baseline models: Multinomial Logistic Regression and single Decision Tree
 - Binary MVP model: AES-reduced vs DES-reduced (verification threshold: Accuracy > 88%, F1 > 0.85)
-- Multiclass model: 4-class Random Forest with StratifiedKFold and GridSearchCV
+- Multiclass model: 4-class Random Forest with validation split tuning via GridSearchCV (PredefinedSplit)
 - Visualization artifacts: Confusion Matrix, ROC curves (One-vs-Rest), Feature Importance
 - Adversarial COA Test: evaluation on full-round ciphers (AES-10r, DES-16r) with <= 35% accuracy threshold
 """
@@ -22,7 +22,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.model_selection import train_test_split, StratifiedKFold, PredefinedSplit, GridSearchCV
 from sklearn.preprocessing import StandardScaler, label_binarize
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
@@ -41,8 +41,8 @@ from sklearn.metrics import (
 CLASS_NAMES = ["AES-red", "DES-red", "3DES-red", "RC4"]
 
 
-def train_baseline_models(X_train, y_train, X_test, y_test):
-    """Trains and evaluates reference baseline models."""
+def train_baseline_models(X_train, y_train, X_val, y_val, X_test, y_test):
+    """Trains baseline models on train set and evaluates on validation and test sets."""
     print("\n" + "=" * 60)
     print(" BASELINE MODELS EVALUATION ")
     print("=" * 60)
@@ -57,11 +57,21 @@ def train_baseline_models(X_train, y_train, X_test, y_test):
     t0 = time.perf_counter()
     pipe_lr.fit(X_train, y_train)
     t_lr = time.perf_counter() - t0
+
+    y_val_lr = pipe_lr.predict(X_val)
+    val_acc_lr = accuracy_score(y_val, y_val_lr)
+    val_f1_lr = f1_score(y_val, y_val_lr, average="macro")
+
     y_pred_lr = pipe_lr.predict(X_test)
     acc_lr = accuracy_score(y_test, y_pred_lr)
     f1_lr = f1_score(y_test, y_pred_lr, average="macro")
-    results["Logistic Regression"] = {"acc": acc_lr, "f1": f1_lr, "time": t_lr, "model": pipe_lr}
-    print(f"[Baseline] Logistic Regression -> Accuracy: {acc_lr:.4f}, F1-Macro: {f1_lr:.4f} ({t_lr:.2f}s)")
+
+    results["Logistic Regression"] = {
+        "val_acc": val_acc_lr, "val_f1": val_f1_lr,
+        "acc": acc_lr, "f1": f1_lr,
+        "time": t_lr, "model": pipe_lr
+    }
+    print(f"[Baseline] Logistic Regression -> Val Acc: {val_acc_lr:.4f}, Val F1: {val_f1_lr:.4f} | Test Acc: {acc_lr:.4f}, Test F1: {f1_lr:.4f} ({t_lr:.2f}s)")
 
     # Single Decision Tree baseline
     pipe_dt = Pipeline([
@@ -71,11 +81,21 @@ def train_baseline_models(X_train, y_train, X_test, y_test):
     t0 = time.perf_counter()
     pipe_dt.fit(X_train, y_train)
     t_dt = time.perf_counter() - t0
+
+    y_val_dt = pipe_dt.predict(X_val)
+    val_acc_dt = accuracy_score(y_val, y_val_dt)
+    val_f1_dt = f1_score(y_val, y_val_dt, average="macro")
+
     y_pred_dt = pipe_dt.predict(X_test)
     acc_dt = accuracy_score(y_test, y_pred_dt)
     f1_dt = f1_score(y_test, y_pred_dt, average="macro")
-    results["Decision Tree"] = {"acc": acc_dt, "f1": f1_dt, "time": t_dt, "model": pipe_dt}
-    print(f"[Baseline] Decision Tree       -> Accuracy: {acc_dt:.4f}, F1-Macro: {f1_dt:.4f} ({t_dt:.2f}s)")
+
+    results["Decision Tree"] = {
+        "val_acc": val_acc_dt, "val_f1": val_f1_dt,
+        "acc": acc_dt, "f1": f1_dt,
+        "time": t_dt, "model": pipe_dt
+    }
+    print(f"[Baseline] Decision Tree       -> Val Acc: {val_acc_dt:.4f}, Val F1: {val_f1_dt:.4f} | Test Acc: {acc_dt:.4f}, Test F1: {f1_dt:.4f} ({t_dt:.2f}s)")
 
     joblib.dump(pipe_lr, "models/baseline_logreg.joblib")
     joblib.dump(pipe_dt, "models/baseline_dt.joblib")
@@ -83,7 +103,7 @@ def train_baseline_models(X_train, y_train, X_test, y_test):
     return results
 
 
-def train_binary_mvp(X_train, y_train, X_test, y_test):
+def train_binary_mvp(X_train, y_train, X_val, y_val, X_test, y_test):
     """Trains and evaluates binary MVP classifier: AES-red (class 0) vs DES-red (class 1)."""
     print("\n" + "=" * 60)
     print(" BINARY MVP MODEL (AES-red vs DES-red) ")
@@ -91,9 +111,11 @@ def train_binary_mvp(X_train, y_train, X_test, y_test):
 
     # Filter binary classes
     mask_train = np.isin(y_train, [0, 1])
+    mask_val = np.isin(y_val, [0, 1])
     mask_test = np.isin(y_test, [0, 1])
 
     X_tr_bin, y_tr_bin = X_train[mask_train], y_train[mask_train]
+    X_val_bin, y_val_bin = X_val[mask_val], y_val[mask_val]
     X_te_bin, y_te_bin = X_test[mask_test], y_test[mask_test]
 
     pipe_rf_bin = Pipeline([
@@ -101,23 +123,28 @@ def train_binary_mvp(X_train, y_train, X_test, y_test):
         ("classifier", RandomForestClassifier(n_estimators=100, max_depth=15, random_state=42, n_jobs=-1))
     ])
     pipe_rf_bin.fit(X_tr_bin, y_tr_bin)
-    y_pred = pipe_rf_bin.predict(X_te_bin)
 
+    y_pred_val = pipe_rf_bin.predict(X_val_bin)
+    val_acc = accuracy_score(y_val_bin, y_pred_val)
+    val_f1 = f1_score(y_val_bin, y_pred_val)
+
+    y_pred = pipe_rf_bin.predict(X_te_bin)
     acc = accuracy_score(y_te_bin, y_pred)
     f1 = f1_score(y_te_bin, y_pred)
 
     status_acc = "PASSED [✓]" if acc > 0.88 else "FAILED [✗]"
     status_f1 = "PASSED [✓]" if f1 > 0.85 else "FAILED [✗]"
 
-    print(f"[MVP] Accuracy: {acc:.4f} (requirement > 0.8800) -> {status_acc}")
-    print(f"[MVP] F1-Score: {f1:.4f} (requirement > 0.8500) -> {status_f1}")
+    print(f"[MVP] Validation -> Accuracy: {val_acc:.4f}, F1-Score: {val_f1:.4f}")
+    print(f"[MVP] Test Set   -> Accuracy: {acc:.4f} (requirement > 0.8800) -> {status_acc}")
+    print(f"[MVP] Test Set   -> F1-Score: {f1:.4f} (requirement > 0.8500) -> {status_f1}")
 
     joblib.dump(pipe_rf_bin, "models/rf_binary_mvp.joblib")
     return acc, f1
 
 
-def train_multiclass_rf(X_train, y_train, X_test, y_test, feature_names):
-    """Trains 4-class Random Forest with hyperparameter tuning via GridSearchCV."""
+def train_multiclass_rf(X_train, y_train, X_val, y_val, X_test, y_test, feature_names):
+    """Trains 4-class Random Forest with hyperparameter tuning via GridSearchCV on validation set."""
     print("\n" + "=" * 60)
     print(" TARGET 4-CLASS RANDOM FOREST (WITH GRIDSEARCH) ")
     print("=" * 60)
@@ -130,27 +157,50 @@ def train_multiclass_rf(X_train, y_train, X_test, y_test, feature_names):
     param_grid = {
         "classifier__n_estimators": [50, 100, 150],
         "classifier__max_depth": [10, 18, None],
+        "classifier__max_features": ["sqrt", "log2"],
         "classifier__min_samples_leaf": [1, 2]
     }
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # Use PredefinedSplit to tune on the dedicated validation set (specification Section 5.4)
+    # -1 marks training samples, 0 marks validation samples
+    X_tune = np.vstack([X_train, X_val])
+    y_tune = np.concatenate([y_train, y_val])
+    test_fold = np.concatenate([np.full(len(X_train), -1), np.full(len(X_val), 0)])
+    cv = PredefinedSplit(test_fold=test_fold)
+
     grid_search = GridSearchCV(
         pipeline,
         param_grid=param_grid,
         cv=cv,
         scoring="f1_macro",
         n_jobs=-1,
+        refit=False,
         verbose=0
     )
 
     t0 = time.perf_counter()
-    grid_search.fit(X_train, y_train)
+    grid_search.fit(X_tune, y_tune)
     t_rf = time.perf_counter() - t0
 
-    best_model = grid_search.best_estimator_
-    print(f"[+] Best hyperparameters: {grid_search.best_params_}")
-    print(f"[+] Best cross-validation F1-Macro: {grid_search.best_score_:.4f}")
+    best_params = grid_search.best_params_
+    print(f"[+] Best hyperparameters (selected on validation set): {best_params}")
+    print(f"[+] Best validation F1-Macro: {grid_search.best_score_:.4f}")
 
+    # Retrain pipeline strictly on X_train (StandardScaler fitted strictly on training data)
+    rf_params = {k.replace("classifier__", ""): v for k, v in best_params.items()}
+    best_model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("classifier", RandomForestClassifier(random_state=42, n_jobs=-1, **rf_params))
+    ])
+    best_model.fit(X_train, y_train)
+
+    # Evaluate on validation set
+    y_pred_val = best_model.predict(X_val)
+    val_acc = accuracy_score(y_val, y_pred_val)
+    val_f1_macro = f1_score(y_val, y_pred_val, average="macro")
+    print(f"[+] Validation set performance -> Accuracy: {val_acc:.4f}, F1-Macro: {val_f1_macro:.4f}")
+
+    # Final held-out evaluation on test set
     y_pred = best_model.predict(X_test)
     y_proba = best_model.predict_proba(X_test)
 
@@ -170,7 +220,7 @@ def train_multiclass_rf(X_train, y_train, X_test, y_test, feature_names):
     # Generate evaluation figures
     _generate_plots(best_model, X_test, y_test, y_pred, y_proba, feature_names, present_classes)
 
-    return best_model, acc, f1_macro, t_rf
+    return best_model, val_acc, val_f1_macro, acc, f1_macro, t_rf
 
 
 def _generate_plots(model, X_test, y_test, y_pred, y_proba, feature_names, present_classes):
@@ -278,23 +328,26 @@ def run_pipeline(features_path, adversarial_path=None):
     print(f"Dataset partitioning: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
 
     # Baseline models evaluation
-    baseline_res = train_baseline_models(X_train, y_train, X_test, y_test)
+    baseline_res = train_baseline_models(X_train, y_train, X_val, y_val, X_test, y_test)
 
     # Binary MVP evaluation
-    train_binary_mvp(X_train, y_train, X_test, y_test)
+    train_binary_mvp(X_train, y_train, X_val, y_val, X_test, y_test)
 
-    # Target 4-class Random Forest with GridSearch
-    best_rf, acc_rf, f1_rf, t_rf = train_multiclass_rf(X_train, y_train, X_test, y_test, feature_cols)
+    # Target 4-class Random Forest with GridSearch on validation set
+    best_rf, val_acc_rf, val_f1_rf, acc_rf, f1_rf, t_rf = train_multiclass_rf(
+        X_train, y_train, X_val, y_val, X_test, y_test, feature_cols
+    )
 
     # Summary table
-    print("\n" + "=" * 60)
-    print(" TEST SET PERFORMANCE SUMMARY ")
-    print("=" * 60)
-    print(f"{'Model':<25} | {'Accuracy':<10} | {'F1-Macro':<10} | {'Time [s]':<8}")
-    print("-" * 60)
+    print("\n" + "=" * 80)
+    print(" PERFORMANCE SUMMARY (VALIDATION & TEST SETS) ")
+    print("=" * 80)
+    print(f"{'Model':<24} | {'Val Acc':<8} | {'Val F1':<8} | {'Test Acc':<8} | {'Test F1':<8} | {'Time [s]':<8}")
+    print("-" * 80)
     for name, r in baseline_res.items():
-        print(f"{name:<25} | {r['acc']:<10.4f} | {r['f1']:<10.4f} | {r['time']:<8.2f}")
-    print(f"{'Random Forest (Final)':<25} | {acc_rf:<10.4f} | {f1_rf:<10.4f} | {t_rf:<8.2f}")
+        print(f"{name:<24} | {r['val_acc']:<8.4f} | {r['val_f1']:<8.4f} | {r['acc']:<8.4f} | {r['f1']:<8.4f} | {r['time']:<8.2f}")
+    print(f"{'Random Forest (Final)':<24} | {val_acc_rf:<8.4f} | {val_f1_rf:<8.4f} | {acc_rf:<8.4f} | {f1_rf:<8.4f} | {t_rf:<8.2f}")
+
 
     # Adversarial COA Test
     if adversarial_path:

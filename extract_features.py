@@ -97,23 +97,58 @@ def extract_features_batch(samples: list[bytes]) -> np.ndarray:
     return np.array([extract_features_from_sample(s) for s in samples], dtype=np.float64)
 
 
+def run_verification_suite():
+    """Runs a verification test suite on a known byte pattern."""
+    print("==================================================")
+    print(" RUNNING FEATURE EXTRACTION VERIFICATION SUITE    ")
+    print("==================================================")
+
+    # Test on repeated byte sample
+    sample_uniform = bytes(range(256)) * 4
+    print(f"[*] Sample size: {len(sample_uniform)} bytes")
+
+    print("\n--- Extracting features from test sample ---")
+    feats = extract_features_from_sample(sample_uniform)
+    print(f"  Feature vector length: {len(feats)}")
+
+    for name, val in zip(FEATURE_NAMES, feats):
+        print(f"  - {name:<15}: {val:12.6f}")
+
+    assert len(feats) == len(FEATURE_NAMES), "Feature count must match FEATURE_NAMES"
+    assert not np.isnan(feats).any(), "Extracted features must not contain NaN"
+    assert not np.isinf(feats).any(), "Extracted features must not contain Inf"
+    print("\n  Validation status    : [PASSED]")
+
+    print("==================================================")
+    print(" ALL TESTS PASSED: Feature extractor is functional!")
+    print("==================================================")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Statistical feature extraction pipeline (Phase 2)")
     parser.add_argument("--input", type=str, default="data/ciphertexts/dataset.npz",
                         help="Path to .npz file containing 'X' (samples) and 'y' (labels)")
     parser.add_argument("--output", type=str, default="data/features.csv",
                         help="Path to output CSV file")
+    parser.add_argument("--test", "--verify", dest="test", action="store_true",
+                        help="Run verification test suite on synthetic sample")
     args = parser.parse_args()
 
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    if args.test:
+        run_verification_suite()
+        return
+
+    if not os.path.exists(args.input):
+        print(f"[*] Dataset file '{args.input}' not found.")
+        print("[*] Running feature extraction self-verification suite instead...")
+        run_verification_suite()
+        return
 
     if not args.input.endswith(".npz"):
         print("[!] Please provide a path to a .npz dataset file containing arrays 'X' and 'y'.")
         return
 
-    if not os.path.exists(args.input):
-        print(f"[!] Input file not found: {args.input}")
-        return
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     print(f"[*] Loading raw samples from {args.input}...")
     data = np.load(args.input, allow_pickle=True)
@@ -137,33 +172,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
-
-    # If CLI arguments are passed, execute main extraction pipeline
-    if len(sys.argv) > 1:
-        main()
-    else:
-        # Run test verification suite
-        print("==================================================")
-        print(" RUNNING FEATURE EXTRACTION VERIFICATION SUITE    ")
-        print("==================================================")
-
-        # Test on repeated byte sample
-        sample_uniform = bytes(range(256)) * 4
-        print(f"[*] Sample size: {len(sample_uniform)} bytes")
-
-        print("\n--- Extracting features from test sample ---")
-        feats = extract_features_from_sample(sample_uniform)
-        print(f"  Feature vector length: {len(feats)}")
-
-        for name, val in zip(FEATURE_NAMES, feats):
-            print(f"  - {name:<15}: {val:12.6f}")
-
-        assert len(feats) == len(FEATURE_NAMES), "Feature count must match FEATURE_NAMES"
-        assert not np.isnan(feats).any(), "Extracted features must not contain NaN"
-        assert not np.isinf(feats).any(), "Extracted features must not contain Inf"
-        print("\n  Validation status    : [PASSED]")
-
-        print("==================================================")
-        print(" ALL TESTS PASSED: Feature extractor is functional!")
-        print("==================================================")
+    main()
