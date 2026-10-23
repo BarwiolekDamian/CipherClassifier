@@ -1,11 +1,34 @@
-# TODO: Implement dataset generation pipeline (Phase 1):
-# - Load low-entropy natural plaintext (e.g., natural language texts from data/raw/)
-# - Slice into fixed-size 1024-byte (1 KB) blocks without variable padding
-# - Encrypt with independent random keys per sample:
-#     * Class 0: AES-reduced (1-2 rounds)
-#     * Class 1: DES-reduced (2 rounds)
-#     * Class 2: 3DES-reduced (2-3 rounds)
-#     * Class 3: RC4 (stream cipher via pycryptodome)
-# - Generate 5,000 samples per class (total 20,000 samples)
-# - Generate adversarial evaluation set with full rounds (min. 1,000 AES-10r and 1,000 DES-16r)
-# - Save raw arrays to data/ciphertexts/
+import urllib.request
+import os
+
+def download_plaintext(url: str, file_name: str = "raw_text.txt") -> bytes:
+
+    if not os.path.exists(file_name):
+        print(f"Pobieranie tekstu z: {url}...")
+        urllib.request.urlretrieve(url, file_name)
+        print("Pobieranie zakończone")
+
+    with open(file_name, 'rb') as f:
+        data_bytes = f.read()
+
+    print(f"Wczytano {len(data_bytes) / 1024:.2f} KB surowych danych")
+    return data_bytes
+
+def propare_blocks(data_bytes: bytes, block_size: int = 1024) -> list[bytes]:
+    blocks = []
+
+    for i in range(0, len(data_bytes) - block_size + 1, block_size):
+        blocks.append(data_bytes[i:i + block_size])
+
+    print(f"Wygenerowano {len(blocks)} bloków tekstowych (każdy po {block_size} bajtów).")
+    return blocks
+
+if __name__ == "__main__":
+    TEXT_URL = "https://wolnelektury.pl/media/book/txt/lalka-tom-pierwszy.txt"
+
+    raw_bytes = download_plaintext(TEXT_URL)
+
+    text_blocks = propare_blocks(raw_bytes, block_size = 1024)
+
+    if text_blocks:
+        print(f"Długość pierwszej próbki: {len(text_blocks[0])} bajtów (oczekiwano: 1024)")
