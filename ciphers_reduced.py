@@ -4,9 +4,12 @@ Educational pure Python/NumPy implementation of reduced-round block ciphers:
 - AES-reduced (1 or 2 rounds, 128-bit / 16 B block size, ECB mode)
 - DES-reduced (reduced-round Feistel network, e.g. 2 rounds, 64-bit / 8 B block size, ECB mode)
 - 3DES-reduced (Triple DES EDE with reduced rounds, 64-bit / 8 B block size, ECB mode)
+- RC4 stream cipher wrapper (via PyCryptodome)
 """
 
+import os
 import numpy as np
+from Crypto.Cipher import ARC4
 
 # =====================================================================
 # AES REDUCED IMPLEMENTATION
@@ -56,7 +59,6 @@ def _aes_key_expansion_128(key: bytes, rounds: int = 2) -> list[np.ndarray]:
     for i in range(4, 4 * (rounds + 1)):
         temp = list(w[i - 1])
         if i % 4 == 0:
-            # RotWord, SubWord and XOR with Rcon
             temp = temp[1:] + temp[:1]
             temp = [int(AES_SBOX[b]) for b in temp]
             temp[0] ^= AES_RCON[(i // 4) - 1]
@@ -73,28 +75,30 @@ def _aes_key_expansion_128(key: bytes, rounds: int = 2) -> list[np.ndarray]:
 
 
 def encrypt_aes_block_reduced(block: np.ndarray, round_keys: list[np.ndarray], rounds: int = 1) -> np.ndarray:
-    """Encrypts a single 16-byte AES block for the specified number of rounds."""
-    # State matrix in column-major order
+    """
+    Encrypts a single 16-byte AES block for the specified number of rounds.
+    In standard AES (FIPS 197), MixColumns is omitted in the final round.
+    For rounds=1, the round is composed of SubBytes, ShiftRows, and AddRoundKey.
+    """
     state = block.reshape((4, 4)).T.copy()
-    state ^= round_keys[0]  # Initial round key addition
+    state ^= round_keys[0]
 
     for r in range(1, rounds + 1):
-        # SubBytes substitution
         state = AES_SBOX[state]
-        # ShiftRows transposition
         for i in range(4):
             state[i] = np.roll(state[i], -i)
-        # MixColumns diffusion
-        for col in range(4):
-            state[:, col] = _mix_single_column(state[:, col])
-        # Round key addition
+        if rounds > 1 and r < rounds:
+            for col in range(4):
+                state[:, col] = _mix_single_column(state[:, col])
         state ^= round_keys[r]
 
     return state.T.flatten()
 
 
-def encrypt_aes_reduced(plaintext: bytes, key: bytes, rounds: int = 1) -> bytes:
+def encrypt_aes_reduced(plaintext: bytes, key: bytes = None, rounds: int = 1) -> bytes:
     """Encrypts a byte sequence in ECB mode using reduced-round AES."""
+    if key is None:
+        key = os.urandom(16)
     round_keys = _aes_key_expansion_128(key, rounds=rounds)
     arr = np.frombuffer(plaintext, dtype=np.uint8)
     out = np.empty_like(arr)
@@ -233,11 +237,8 @@ def _des_key_schedule(key_bytes: bytes, rounds: int = 2) -> list[np.ndarray]:
 
 def _des_feistel_f(r_bits: np.ndarray, subkey_48: np.ndarray) -> np.ndarray:
     """The Feistel round function F in DES."""
-    # Expansion from 32 to 48 bits
     expanded = _permute(r_bits, DES_E)
-    # Key mixing with round subkey
     xored = expanded ^ subkey_48
-    # S-Box substitution
     sbox_out = []
     for s_idx in range(8):
         chunk = xored[s_idx * 6 : (s_idx + 1) * 6]
@@ -245,7 +246,6 @@ def _des_feistel_f(r_bits: np.ndarray, subkey_48: np.ndarray) -> np.ndarray:
         col = (chunk[1] << 3) | (chunk[2] << 2) | (chunk[3] << 1) | chunk[4]
         val = DES_SBOXES[s_idx][row * 16 + col]
         sbox_out.extend([(val >> 3) & 1, (val >> 2) & 1, (val >> 1) & 1, val & 1])
-    # Permutation P
     return _permute(np.array(sbox_out, dtype=np.uint8), DES_P)
 
 
@@ -260,14 +260,15 @@ def encrypt_des_block_reduced(block_bytes: bytes, subkeys: list[np.ndarray]) -> 
         r_next = l ^ _des_feistel_f(r, k)
         l, r = l_next, r_next
 
-    # Swap left and right halves before final permutation
     pre_fp = np.concatenate([r, l])
     cipher_bits = _permute(pre_fp, DES_FP)
     return np.packbits(cipher_bits).tobytes()
 
 
-def encrypt_des_reduced(plaintext: bytes, key: bytes, rounds: int = 2) -> bytes:
+def encrypt_des_reduced(plaintext: bytes, key: bytes = None, rounds: int = 2) -> bytes:
     """Encrypts a byte sequence in ECB mode using reduced-round DES."""
+    if key is None:
+        key = os.urandom(8)
     subkeys = _des_key_schedule(key, rounds=rounds)
     out = bytearray(len(plaintext))
     num_blocks = len(plaintext) // 8
@@ -281,27 +282,38 @@ def encrypt_des_reduced(plaintext: bytes, key: bytes, rounds: int = 2) -> bytes:
 # 3DES REDUCED IMPLEMENTATION
 # =====================================================================
 
-def encrypt_3des_reduced(plaintext: bytes, key: bytes, rounds_per_stage: int = 1) -> bytes:
+def encrypt_3des_reduced(plaintext: bytes, key: bytes = None, rounds_per_stage: int = 1) -> bytes:
     """
     Reduced Triple DES in EDE (Encrypt-Decrypt-Encrypt) mode:
     Accepts 24-byte key (three 8-byte subkeys).
-    Each phase executes reduced DES Feistel rounds.
+    Each phase executes reduced DES Feistel rounds (default: 1 round per stage, 3 rounds total).
     """
-    if len(key) < 24:
+    if key is None:
+        key = os.urandom(24)
+    elif len(key) < 24:
         key = (key * 3)[:24]
     k1, k2, k3 = key[:8], key[8:16], key[16:24]
 
-    # Encrypt using first subkey
     step1 = encrypt_des_reduced(plaintext, k1, rounds=rounds_per_stage)
-    # Decrypt using second subkey with reversed schedule
     subkeys_k2 = _des_key_schedule(k2, rounds=rounds_per_stage)[::-1]
     step2 = bytearray(len(step1))
     for i in range(len(step1) // 8):
         blk = step1[i * 8 : (i + 1) * 8]
         step2[i * 8 : (i + 1) * 8] = encrypt_des_block_reduced(blk, subkeys_k2)
-    # Encrypt using third subkey
     step3 = encrypt_des_reduced(bytes(step2), k3, rounds=rounds_per_stage)
     return step3
+
+
+# =====================================================================
+# RC4 STREAM CIPHER (PYCRYPTODOME WRAPPER)
+# =====================================================================
+
+def encrypt_rc4(plaintext: bytes, key: bytes = None) -> bytes:
+    """Encrypts a byte sequence using RC4 (ARC4 via PyCryptodome)."""
+    if key is None:
+        key = os.urandom(16)
+    cipher = ARC4.new(key)
+    return cipher.encrypt(plaintext)
 
 
 if __name__ == "__main__":
@@ -334,6 +346,13 @@ if __name__ == "__main__":
     print(f"  Output size : {len(tdes_out)} bytes")
     print(f"  First 16 B  : {tdes_out[:16].hex()}")
     assert len(tdes_out) == 1024, "3DES output must match exact 1024 bytes"
+    print("  Status      : [PASSED]")
+
+    print("\n--- Testing RC4 (PyCryptodome) ---")
+    rc4_out = encrypt_rc4(sample_plaintext, key16)
+    print(f"  Output size : {len(rc4_out)} bytes")
+    print(f"  First 16 B  : {rc4_out[:16].hex()}")
+    assert len(rc4_out) == 1024, "RC4 output must match exact 1024 bytes"
     print("  Status      : [PASSED]")
 
     print("\n==================================================")

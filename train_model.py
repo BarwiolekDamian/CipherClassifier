@@ -348,6 +348,10 @@ def run_pipeline(features_path, adversarial_path=None):
         print(f"{name:<24} | {r['val_acc']:<8.4f} | {r['val_f1']:<8.4f} | {r['acc']:<8.4f} | {r['f1']:<8.4f} | {r['time']:<8.2f}")
     print(f"{'Random Forest (Final)':<24} | {val_acc_rf:<8.4f} | {val_f1_rf:<8.4f} | {acc_rf:<8.4f} | {f1_rf:<8.4f} | {t_rf:<8.2f}")
 
+    best_baseline_acc = max(r['acc'] for r in baseline_res.values())
+    gain_pp = (acc_rf - best_baseline_acc) * 100
+    status_gain = "PASSED [✓]" if gain_pp >= 5.0 else "WARNING [!]"
+    print(f"\n[*] Ensemble Gain over Best Baseline: {gain_pp:+.2f} p.p. (requirement >= +5.00 p.p.) -> {status_gain}")
 
     # Adversarial COA Test
     if adversarial_path:
