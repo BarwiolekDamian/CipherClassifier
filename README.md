@@ -18,12 +18,26 @@ CipherClassifier/
 ├── extract_features.py      # Phase 2: Statistical feature extraction pipeline
 ├── train_model.py           # Phase 3 & 4: Baselines, MVP binary classifier, 4-class RF tuning & COA test
 ├── predict.py               # Phase 5: Production CLI inference script with latency and uncertainty monitoring
+├── run_all.py               # End-to-end pipeline orchestrator (Phases 1-5 in a single command)
 ├── requirements.txt         # Pinned project dependencies
 └── README.md                # Project documentation and architecture overview
 ```
 
+## Quick Start (One Command Execution)
+
+Aby uruchomić cały pipeline od wygenerowania danych aż po inferencję:
+
+```bash
+# Szybki test weryfikacyjny (~30-60 sekund):
+python run_all.py --quick
+
+# Pełny eksperyment ze specyfikacji (20 000 próbek + 2 000 próbek adversarialnych):
+python run_all.py --full
+```
+
 ## Module Descriptions
 
+- **`run_all.py`**: Skrypt orkiestratora wykonujący kolejno wszystkie fazy MLOps (1–5) z pomiarem czasu i raportowaniem błędów.
 - **`ciphers_reduced.py`**: Implements educational reduced-round versions of AES (1–2 rounds), DES (2 rounds), and 3DES (2–3 rounds) in ECB mode without external high-level round restrictions.
 - **`generate_data.py`**: Generates balanced 1024-byte ciphertext datasets (5,000 samples per class across 4 families) and full-round control samples for adversarial evaluation.
 - **`extract_features.py`**: Computes mandatory and optional statistical features from raw byte arrays (entropy, NIST frequency test, Index of Coincidence, autocorrelations, Chi-square, Runs test).
