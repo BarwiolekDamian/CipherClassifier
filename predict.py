@@ -14,8 +14,11 @@ import argparse
 import os
 import sys
 import time
+import warnings
 import joblib
 import numpy as np
+
+warnings.filterwarnings("ignore", category=UserWarning, module=r"sklearn\.utils\.parallel")
 
 from extract_features import extract_features_from_sample
 

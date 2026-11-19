@@ -10,3 +10,15 @@ venv.bak/
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Output data
+data/*.csv
+data/ciphertexts/*.npz
+data/ciphertexts/*.npy
+data/raw/*.txt
+
+# Figures
+figures/*.png
+
+# Models
+models/*.joblib

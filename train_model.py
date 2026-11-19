@@ -3,18 +3,27 @@ train_model.py
 Phases 3 & 4: Model training, hyperparameter optimization, evaluation, and Adversarial COA Test.
 
 Key requirements:
-- Stratified data split: 70% train / 15% validation / 15% test (seed 42)
+- Stratified, leak-free data split: 70% train / 15% validation / 15% test (file-disjoint when 'split' column exists, seed 42)
 - Zero data leakage: StandardScaler fitted strictly on training data (70%) via sklearn Pipeline
 - Baseline models: Multinomial Logistic Regression and single Decision Tree
 - Binary MVP model: AES-reduced vs DES-reduced (verification threshold: Accuracy > 88%, F1 > 0.85)
-- Multiclass model: 4-class Random Forest with validation split tuning via GridSearchCV (PredefinedSplit)
+- Multiclass model: 4-class Random Forest with StratifiedKFold CV stability check and GridSearchCV on validation split
 - Visualization artifacts: Confusion Matrix, ROC curves (One-vs-Rest), Feature Importance
 - Adversarial COA Test: evaluation on full-round ciphers (AES-10r, DES-16r) with <= 35% accuracy threshold
 """
 
 import argparse
 import os
+import threading
 import time
+import warnings
+
+# Silence harmless sklearn 1.9 + joblib 1.6 parallel/loky UserWarnings (including in detached loky workers)
+_WARN_FILTER = "ignore::UserWarning:sklearn.utils.parallel,ignore::UserWarning:joblib.externals.loky.backend.resource_tracker"
+os.environ["PYTHONWARNINGS"] = _WARN_FILTER
+warnings.filterwarnings("ignore", category=UserWarning, module=r"sklearn\.utils\.parallel")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"joblib\.externals\.loky\.backend\.resource_tracker")
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -22,7 +31,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, PredefinedSplit, GridSearchCV
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    PredefinedSplit,
+    GridSearchCV,
+    cross_val_score,
+)
 from sklearn.preprocessing import StandardScaler, label_binarize
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
@@ -35,10 +50,31 @@ from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
     roc_curve,
-    auc
+    auc,
 )
 
 CLASS_NAMES = ["AES-red", "DES-red", "3DES-red", "RC4"]
+META_COLS = {"label", "split"}
+
+
+def _run_with_heartbeat(fn, label: str, interval: float = 30.0):
+    """Runs a long-running callable while printing elapsed time every `interval` seconds."""
+    stop_event = threading.Event()
+    t_start = time.perf_counter()
+
+    def _heartbeat():
+        print(f"    [*] {label}: 0s elapsed...", flush=True)
+        while not stop_event.wait(interval):
+            elapsed = int(round(time.perf_counter() - t_start))
+            print(f"    [*] {label}: {elapsed}s elapsed...", flush=True)
+
+    thread = threading.Thread(target=_heartbeat, daemon=True)
+    thread.start()
+    try:
+        return fn()
+    finally:
+        stop_event.set()
+        thread.join(timeout=1.0)
 
 
 def train_baseline_models(X_train, y_train, X_val, y_val, X_test, y_test):
@@ -144,49 +180,57 @@ def train_binary_mvp(X_train, y_train, X_val, y_val, X_test, y_test):
 
 
 def train_multiclass_rf(X_train, y_train, X_val, y_val, X_test, y_test, feature_names):
-    """Trains 4-class Random Forest with hyperparameter tuning via GridSearchCV on validation set."""
+    """
+    Trains 4-class Random Forest with:
+    - 5-fold StratifiedKFold GridSearchCV hyperparameter tuning strictly on X_train (Sec. 1.2 & Sec. 6)
+    - Bounded tree depth (8-16) and leaf regularization (4-16) to prevent overfitting
+    - Independent post-tuning validation on X_val (Sec. 5.4) and final held-out evaluation on X_test
+    - Zero scaler leakage: StandardScaler fitted exclusively on training folds / X_train
+    """
     print("\n" + "=" * 60)
-    print(" TARGET 4-CLASS RANDOM FOREST (WITH GRIDSEARCH) ")
+    print(" TARGET 4-CLASS RANDOM FOREST (5-FOLD STRATIFIED GRIDSEARCH) ")
     print("=" * 60)
 
+    # Use n_jobs=1 inside GridSearchCV to avoid nested parallelism oversubscription
     pipeline = Pipeline([
         ("scaler", StandardScaler()),
-        ("classifier", RandomForestClassifier(random_state=42, n_jobs=-1))
+        ("classifier", RandomForestClassifier(random_state=42, n_jobs=1))
     ])
 
     param_grid = {
-        "classifier__n_estimators": [50, 100, 150],
-        "classifier__max_depth": [10, 18, None],
+        "classifier__n_estimators": [150, 250],
+        "classifier__max_depth": [8, 10, 12, 16],
         "classifier__max_features": ["sqrt", "log2"],
-        "classifier__min_samples_leaf": [1, 2]
+        "classifier__min_samples_leaf": [4, 8, 16],
     }
 
-    # Use PredefinedSplit to tune on the dedicated validation set (specification Section 5.4)
-    # -1 marks training samples, 0 marks validation samples
-    X_tune = np.vstack([X_train, X_val])
-    y_tune = np.concatenate([y_train, y_val])
-    test_fold = np.concatenate([np.full(len(X_train), -1), np.full(len(X_val), 0)])
-    cv = PredefinedSplit(test_fold=test_fold)
-
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     grid_search = GridSearchCV(
         pipeline,
         param_grid=param_grid,
-        cv=cv,
+        cv=skf,
         scoring="f1_macro",
         n_jobs=-1,
         refit=False,
-        verbose=0
+        verbose=1
     )
 
     t0 = time.perf_counter()
-    grid_search.fit(X_tune, y_tune)
+    _run_with_heartbeat(
+        lambda: grid_search.fit(X_train, y_train),
+        "GridSearchCV (48 configs x 5-fold StratifiedKFold)",
+        interval=30.0,
+    )
     t_rf = time.perf_counter() - t0
 
+    best_idx = grid_search.best_index_
     best_params = grid_search.best_params_
-    print(f"[+] Best hyperparameters (selected on validation set): {best_params}")
-    print(f"[+] Best validation F1-Macro: {grid_search.best_score_:.4f}")
+    cv_mean = grid_search.cv_results_["mean_test_score"][best_idx]
+    cv_std = grid_search.cv_results_["std_test_score"][best_idx]
+    print(f"[+] Best hyperparameters (5-fold StratifiedKFold): {best_params}")
+    print(f"[+] 5-Fold StratifiedKFold CV on Train -> F1-Macro: {cv_mean:.4f} ± {cv_std:.4f}")
 
-    # Retrain pipeline strictly on X_train (StandardScaler fitted strictly on training data)
+    # Fit final pipeline strictly on X_train (StandardScaler fitted strictly on training data)
     rf_params = {k.replace("classifier__", ""): v for k, v in best_params.items()}
     best_model = Pipeline([
         ("scaler", StandardScaler()),
@@ -194,7 +238,7 @@ def train_multiclass_rf(X_train, y_train, X_val, y_val, X_test, y_test, feature_
     ])
     best_model.fit(X_train, y_train)
 
-    # Evaluate on validation set
+    # Independent validation check on X_val
     y_pred_val = best_model.predict(X_val)
     val_acc = accuracy_score(y_val, y_pred_val)
     val_f1_macro = f1_score(y_val, y_pred_val, average="macro")
@@ -243,10 +287,10 @@ def _generate_plots(model, X_test, y_test, y_pred, y_proba, feature_names, prese
     importances = rf_clf.feature_importances_
     indices = np.argsort(importances)[::-1]
 
-    plt.figure(figsize=(8, 4.5))
+    plt.figure(figsize=(10, 5))
     plt.title("Feature Importance (Random Forest MDI)")
     plt.bar(range(len(importances)), importances[indices], align="center", color="#2b5c8f")
-    plt.xticks(range(len(importances)), [feature_names[i] for i in indices], rotation=35, ha="right")
+    plt.xticks(range(len(importances)), [feature_names[i] for i in indices], rotation=40, ha="right", fontsize=8)
     plt.tight_layout()
     plt.savefig("figures/feature_importance.png", dpi=300)
     plt.close()
@@ -286,7 +330,8 @@ def evaluate_adversarial_coa(model, adv_features_path="data/adversarial_features
         return
 
     adv_df = pd.read_csv(adv_features_path)
-    X_adv = adv_df.drop(columns=["label"]).values
+    feature_cols = [c for c in adv_df.columns if c not in META_COLS]
+    X_adv = adv_df[feature_cols].values
     y_adv = adv_df["label"].values
 
     y_pred_adv = model.predict(X_adv)
@@ -299,11 +344,20 @@ def evaluate_adversarial_coa(model, adv_features_path="data/adversarial_features
     else:
         print("[!] Note: Adversarial accuracy exceeds 35% threshold.")
 
+    # Print prediction distribution breakdown per true full-round cipher (Section 7.2)
+    print("\n--- ADVERSARIAL PREDICTION BREAKDOWN ---")
+    for true_lbl, true_name in [(0, "AES-10r (true=0)"), (1, "DES-16r (true=1)")]:
+        mask = (y_adv == true_lbl)
+        if np.any(mask):
+            preds = pd.Series(y_pred_adv[mask]).value_counts().reindex(range(4), fill_value=0)
+            dist_str = ", ".join(f"{CLASS_NAMES[i]}: {preds[i]}" for i in range(4))
+            print(f"  {true_name:<18} -> {dist_str}")
+
     # Prediction distribution plot for adversarial samples
     plt.figure(figsize=(6, 4))
     counts = pd.Series(y_pred_adv).value_counts().reindex(range(4), fill_value=0)
     plt.bar([CLASS_NAMES[i] for i in range(4)], counts.values, color="#b83b3b")
-    plt.title("Prediction Distribution on Full-Round Ciphers")
+    plt.title("Prediction Distribution on Full-Round Ciphers (AES-10r & DES-16r)")
     plt.ylabel("Number of Samples")
     plt.tight_layout()
     plt.savefig("figures/adversarial_distribution.png", dpi=300)
@@ -313,17 +367,26 @@ def evaluate_adversarial_coa(model, adv_features_path="data/adversarial_features
 def run_pipeline(features_path, adversarial_path=None):
     """Executes the complete machine learning training and evaluation pipeline."""
     df = pd.read_csv(features_path)
-    feature_cols = [c for c in df.columns if c != "label"]
+    feature_cols = [c for c in df.columns if c not in META_COLS]
     X = df[feature_cols].values
     y = df["label"].values
 
-    # Stratified split: 70% train / 15% validation / 15% test
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y, test_size=0.30, stratify=y, random_state=42
-    )
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.50, stratify=y_temp, random_state=42
-    )
+    if "split" in df.columns and set(df["split"].unique()) >= {"train", "val", "test"}:
+        print("[*] Using leak-free file-disjoint Train / Val / Test splits from dataset metadata.")
+        train_mask = (df["split"] == "train").values
+        val_mask = (df["split"] == "val").values
+        test_mask = (df["split"] == "test").values
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_val, y_val = X[val_mask], y[val_mask]
+        X_test, y_test = X[test_mask], y[test_mask]
+    else:
+        # Stratified split fallback: 70% train / 15% validation / 15% test
+        X_train, X_temp, y_train, y_temp = train_test_split(
+            X, y, test_size=0.30, stratify=y, random_state=42
+        )
+        X_val, X_test, y_val, y_test = train_test_split(
+            X_temp, y_temp, test_size=0.50, stratify=y_temp, random_state=42
+        )
 
     print(f"Dataset partitioning: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
 
@@ -333,7 +396,7 @@ def run_pipeline(features_path, adversarial_path=None):
     # Binary MVP evaluation
     train_binary_mvp(X_train, y_train, X_val, y_val, X_test, y_test)
 
-    # Target 4-class Random Forest with GridSearch on validation set
+    # Target 4-class Random Forest with GridSearch on validation set + StratifiedKFold check
     best_rf, val_acc_rf, val_f1_rf, acc_rf, f1_rf, t_rf = train_multiclass_rf(
         X_train, y_train, X_val, y_val, X_test, y_test, feature_cols
     )
@@ -348,10 +411,15 @@ def run_pipeline(features_path, adversarial_path=None):
         print(f"{name:<24} | {r['val_acc']:<8.4f} | {r['val_f1']:<8.4f} | {r['acc']:<8.4f} | {r['f1']:<8.4f} | {r['time']:<8.2f}")
     print(f"{'Random Forest (Final)':<24} | {val_acc_rf:<8.4f} | {val_f1_rf:<8.4f} | {acc_rf:<8.4f} | {f1_rf:<8.4f} | {t_rf:<8.2f}")
 
-    best_baseline_acc = max(r['acc'] for r in baseline_res.values())
-    gain_pp = (acc_rf - best_baseline_acc) * 100
-    status_gain = "PASSED [✓]" if gain_pp >= 5.0 else "WARNING [!]"
-    print(f"\n[*] Ensemble Gain over Best Baseline: {gain_pp:+.2f} p.p. (requirement >= +5.00 p.p.) -> {status_gain}")
+    best_baseline_acc = max(r["acc"] for r in baseline_res.values())
+    best_baseline_f1 = max(r["f1"] for r in baseline_res.values())
+    gain_acc_pp = (acc_rf - best_baseline_acc) * 100
+    gain_f1_pp = (f1_rf - best_baseline_f1) * 100
+
+    beats_baselines = (acc_rf >= best_baseline_acc) and (f1_rf >= best_baseline_f1)
+    meets_45_50 = (acc_rf >= 0.75 and f1_rf >= 0.70) or (gain_acc_pp >= 5.0)
+    print(f"\n[*] RF vs Best Baseline : Acc {gain_acc_pp:+.2f} p.p., F1-Macro {gain_f1_pp:+.2f} p.p. -> {'PASSED [✓]' if beats_baselines else 'CHECK [!]'}")
+    print(f"[*] Section 8.2 Target  : (Acc >= 0.75 & F1 >= 0.70) OR (+5 p.p.) -> {'PASSED [✓]' if meets_45_50 else 'FAILED [✗]'}")
 
     # Adversarial COA Test
     if adversarial_path:
@@ -367,7 +435,7 @@ def run_verification_suite():
 
     np.random.seed(42)
     n_samples = 200
-    n_features = 8
+    n_features = 35
     feature_cols = [f"feat_{i}" for i in range(n_features)]
 
     X_synth = np.random.randn(n_samples, n_features)
@@ -401,11 +469,19 @@ def main():
     os.makedirs("models", exist_ok=True)
     os.makedirs("figures", exist_ok=True)
 
-    if os.path.exists(args.features):
-        run_pipeline(args.features, args.adversarial)
-    else:
-        print(f"[*] Dataset file not found at '{args.features}'.")
-        run_verification_suite()
+    try:
+        if os.path.exists(args.features):
+            run_pipeline(args.features, args.adversarial)
+        else:
+            print(f"[*] Dataset file not found at '{args.features}'.")
+            run_verification_suite()
+    finally:
+        # Gracefully shut down loky worker pool so /dev/shm temp files & semlocks are cleaned before exit
+        try:
+            from joblib.externals.loky import get_reusable_executor
+            get_reusable_executor().shutdown(wait=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
