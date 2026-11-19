@@ -285,8 +285,10 @@ def encrypt_des_reduced(plaintext: bytes, key: bytes = None, rounds: int = 2) ->
 def encrypt_3des_reduced(plaintext: bytes, key: bytes = None, rounds_per_stage: int = 1) -> bytes:
     """
     Reduced Triple DES in EDE (Encrypt-Decrypt-Encrypt) mode:
-    Accepts 24-byte key (three 8-byte subkeys).
-    Each phase executes reduced DES Feistel rounds (default: 1 round per stage, 3 rounds total).
+    Accepts 24-byte key (three 8-byte subkeys: K1, K2, K3).
+    Executes continuous Feistel E-D-E rounds (default: 1 round per stage -> 3 rounds total)
+    using K1 (encrypt schedule), K2 (reversed decrypt schedule), and K3 (encrypt schedule)
+    within a single IP/FP block envelope so both 32-bit Feistel halves undergo genuine diffusion.
     """
     if key is None:
         key = os.urandom(24)
@@ -294,14 +296,17 @@ def encrypt_3des_reduced(plaintext: bytes, key: bytes = None, rounds_per_stage: 
         key = (key * 3)[:24]
     k1, k2, k3 = key[:8], key[8:16], key[16:24]
 
-    step1 = encrypt_des_reduced(plaintext, k1, rounds=rounds_per_stage)
-    subkeys_k2 = _des_key_schedule(k2, rounds=rounds_per_stage)[::-1]
-    step2 = bytearray(len(step1))
-    for i in range(len(step1) // 8):
-        blk = step1[i * 8 : (i + 1) * 8]
-        step2[i * 8 : (i + 1) * 8] = encrypt_des_block_reduced(blk, subkeys_k2)
-    step3 = encrypt_des_reduced(bytes(step2), k3, rounds=rounds_per_stage)
-    return step3
+    subkeys_k1 = _des_key_schedule(k1, rounds=rounds_per_stage)
+    subkeys_k2_dec = _des_key_schedule(k2, rounds=rounds_per_stage)[::-1]
+    subkeys_k3 = _des_key_schedule(k3, rounds=rounds_per_stage)
+    ede_subkeys = subkeys_k1 + subkeys_k2_dec + subkeys_k3
+
+    out = bytearray(len(plaintext))
+    num_blocks = len(plaintext) // 8
+    for i in range(num_blocks):
+        blk = plaintext[i * 8 : (i + 1) * 8]
+        out[i * 8 : (i + 1) * 8] = encrypt_des_block_reduced(blk, ede_subkeys)
+    return bytes(out)
 
 
 # =====================================================================

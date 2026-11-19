@@ -15,6 +15,12 @@ import subprocess
 import sys
 import time
 
+# Propagate clean warning filters to all pipeline subprocesses and loky resource_tracker
+os.environ["PYTHONWARNINGS"] = (
+    "ignore::UserWarning:sklearn.utils.parallel,"
+    "ignore::UserWarning:joblib.externals.loky.backend.resource_tracker"
+)
+
 
 def print_banner(text: str, char: str = "="):
     border = char * 65
@@ -156,7 +162,9 @@ def main():
     print(f"  TOTAL EXECUTION TIME         : {total_time:8.2f} s ({total_time / 60:.2f} min)")
     print("\n[✓] Generated Artifacts:")
     print("  - Models  : models/rf_4class_final.joblib, models/rf_binary_mvp.joblib, models/baseline_*.joblib")
-    print("  - Figures : figures/confusion_matrix.png, figures/roc_curves.png, figures/feature_importance.png")
+    print("  - Figures : figures/eda_boxplots.png, figures/eda_correlation_matrix.png,")
+    print("              figures/confusion_matrix.png, figures/roc_curves.png,")
+    print("              figures/feature_importance.png, figures/adversarial_distribution.png")
     print("  - Data    : data/features.csv, data/adversarial_features.csv")
     print_banner("ALL PHASES COMPLETED SUCCESSFULLY!")
 
